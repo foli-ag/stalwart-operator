@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
+          key: ${{ hashFiles('flake.lock', 'nix/toolchain.nix', 'Cargo.lock') }}
+      # The tests include one that keeps deploy/crd.yaml in step with the code.
+      - name: Lint and test
+        run: |
+          nix develop -c cargo fmt --check
+          nix develop -c cargo clippy --all-targets -- -D warnings
+          nix develop -c cargo test
+
+  # Every push to main publishes `main` and the commit; a `v*` tag publishes the
+  # version and `latest`.
+  image:
+    needs: check
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - name: Build
+        run: nix build .#image -o image
+      - name: Push
+        env:
+          CREDS: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+        run: |
+          repo=ghcr.io/${{ github.repository }}
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tags=("${GITHUB_REF_NAME#v}" latest)
+          else
+            tags=(main "$GITHUB_SHA")
+          fi
+          for tag in "${tags[@]}"; do
+            nix run .#skopeo -- copy --dest-creds "$CREDS" \
+              docker-archive:image "docker://$repo:$tag"
+          done

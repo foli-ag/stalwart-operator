@@ -1,0 +1,112 @@
+# stalwart-operator, with the CRD in crd.yaml next to this file. Apply both, then
+# create the admin credentials Secret (see README), and edit the ConfigMap:
+#
+#   kubectl apply -f deploy/crd.yaml -f deploy/operator.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stalwart-operator
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stalwart-operator
+  namespace: stalwart-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: stalwart-operator
+rules:
+  - apiGroups: ["stalwart.foli.ag"]
+    resources: ["mailsenders"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["stalwart.foli.ag"]
+    resources: ["mailsenders/status", "mailsenders/finalizers"]
+    verbs: ["get", "patch", "update"]
+  # The Secrets it writes next to each MailSender.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: stalwart-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: stalwart-operator
+subjects:
+  - kind: ServiceAccount
+    name: stalwart-operator
+    namespace: stalwart-operator
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stalwart-operator
+  namespace: stalwart-operator
+data:
+  operator.toml: |
+    # Stalwart's HTTP listener as the operator reaches it.
+    [stalwart]
+    url = "http://stalwart.mail.svc:8080"
+
+    # What apps are told to connect to, written to each Secret.
+    [smtp]
+    host = "mail.example.com"
+    port = 465
+    implicit_tls = true
+
+    # Which addresses each namespace may claim: exact, or `*@domain`.
+    # Namespaces not listed fall back to [default]; without it they get nothing.
+    [namespaces.my-app]
+    addresses = ["noreply@example.com"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stalwart-operator
+  namespace: stalwart-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: stalwart-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: stalwart-operator
+    spec:
+      serviceAccountName: stalwart-operator
+      containers:
+        - name: operator
+          image: ghcr.io/foli-ag/stalwart-operator:0.1.0
+          env:
+            - name: OPERATOR_CONFIG_PATH
+              value: /etc/stalwart-operator/operator.toml
+          # STALWART_USER and STALWART_PASSWORD.
+          envFrom:
+            - secretRef:
+                name: stalwart-operator-admin
+          volumeMounts:
+            - name: config
+              mountPath: /etc/stalwart-operator
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: config
+          configMap:
+            name: stalwart-operator
