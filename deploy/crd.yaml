@@ -81,3 +81,106 @@ spec:
     storage: true
     subresources:
       status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clustermailsenders.stalwart.foli.ag
+spec:
+  group: stalwart.foli.ag
+  names:
+    kind: ClusterMailSender
+    plural: clustermailsenders
+    shortNames:
+    - cmsender
+    singular: clustermailsender
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.address
+      name: Address
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ClusterMailSenderSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              An address several namespaces send from, such as a platform's shared
+              `noreply@`: one Stalwart account, whose credentials the operator writes into
+              the same Secret in each of `namespaces`. Cluster-scoped, so only whoever may
+              create cluster resources can claim an address this way; the namespace policy,
+              which guards `MailSender`, does not apply.
+            properties:
+              address:
+                description: The address the apps send from. Its domain must be one Stalwart serves.
+                type: string
+              namespaces:
+                description: |-
+                  The namespaces the credentials are written to. Removing one deletes its
+                  Secret.
+                items:
+                  type: string
+                type: array
+              secretName:
+                description: |-
+                  The Secret the credentials are written to in each namespace. Defaults to
+                  `<name>-smtp`.
+                nullable: true
+                type: string
+            required:
+            - address
+            - namespaces
+            type: object
+          status:
+            nullable: true
+            properties:
+              address:
+                description: |-
+                  The address the Stalwart account was created for, so a changed
+                  `spec.address` can remove the old account.
+                nullable: true
+                type: string
+              message:
+                description: Why the last reconcile did not reach `Ready`.
+                nullable: true
+                type: string
+              namespaces:
+                default: []
+                description: |-
+                  The namespaces the Secret was written to, so one dropped from the spec
+                  has its Secret deleted.
+                items:
+                  type: string
+                type: array
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                enum:
+                - Ready
+                - Denied
+                - Failed
+                nullable: true
+                type: string
+              secretName:
+                description: The Secret holding the credentials.
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: ClusterMailSender
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -19,12 +19,17 @@ metadata:
   name: stalwart-operator
 rules:
   - apiGroups: ["stalwart.foli.ag"]
-    resources: ["mailsenders"]
+    resources: ["mailsenders", "clustermailsenders"]
     verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: ["stalwart.foli.ag"]
-    resources: ["mailsenders/status", "mailsenders/finalizers"]
+    resources:
+      - mailsenders/status
+      - mailsenders/finalizers
+      - clustermailsenders/status
+      - clustermailsenders/finalizers
     verbs: ["get", "patch", "update"]
-  # The Secrets it writes next to each MailSender.
+  # The Secrets it writes next to each MailSender, and in each namespace a
+  # ClusterMailSender names.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
@@ -82,7 +87,7 @@ spec:
       serviceAccountName: stalwart-operator
       containers:
         - name: operator
-          image: ghcr.io/foli-ag/stalwart-operator:0.1.0
+          image: ghcr.io/foli-ag/stalwart-operator:0.2.0
           env:
             - name: OPERATOR_CONFIG_PATH
               value: /etc/stalwart-operator/operator.toml

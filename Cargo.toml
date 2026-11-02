@@ -1,6 +1,6 @@
 [package]
 name = "stalwart-operator"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Kubernetes operator that gives apps SMTP credentials from a Stalwart mail server"
 license = "Apache-2.0"

@@ -29,13 +29,31 @@ Mail sent with these credentials is signed with the domain's DKIM key like any o
 
 Requires Stalwart 1.0 or later (the JMAP management API).
 
+## Sharing an address across namespaces
+
+Several apps can send from one address, such as a platform's `noreply@`, through a cluster-scoped `ClusterMailSender`:
+
+```yaml
+apiVersion: stalwart.foli.ag/v1alpha1
+kind: ClusterMailSender
+metadata:
+  name: noreply
+spec:
+  address: noreply@example.com
+  namespaces: [auth, shop]
+```
+
+The operator creates one account and one app password for it, and writes the same Secret, `noreply-smtp` here, into each listed namespace. Removing a namespace from the list deletes its Secret; deleting the `ClusterMailSender` removes the account and every Secret. Only whoever may create cluster-scoped resources can declare one, so the namespace policy below does not apply to it.
+
+An address held by a `MailSender` is not shared: the `ClusterMailSender` reports it taken and checks again at every requeue. To move an address over, declare the `ClusterMailSender`, then delete the `MailSender`. Its account goes with it, so the apps that used it send nothing until the new Secret is written and they read it again.
+
 ## How it works
 
-- Accounts are created through Stalwart's management API as an administrator. The operator marks each one with a description naming its `MailSender`, and never touches an account without that mark, so it can't take over a person's mailbox even if a namespace is allowed their address.
+- Accounts are created through Stalwart's management API as an administrator. The operator marks each one with a description naming its `MailSender` or `ClusterMailSender`, and never touches an account without that mark, so it can't take over a person's mailbox even if a namespace is allowed their address.
 - App passwords belong to an account. The operator creates them by logging in as the account with Stalwart's master-user syntax, `<address>%<admin>` and the administrator's password.
 - Stalwart generates app passwords and shows them once, so the Secret is the only copy. It records the credential's id: while that credential exists the Secret is kept; if the Secret or the credential is lost, a new password is created, written, and every other app password on the account removed.
 - App passwords are checked by Stalwart itself, so they work even when people sign in through an external directory such as OIDC.
-- Change the `stalwart.foli.ag/rotate` annotation on a `MailSender` to any new value to rotate its password.
+- Change the `stalwart.foli.ag/rotate` annotation on a `MailSender` or `ClusterMailSender` to any new value to rotate its password.
 - Changing `spec.address` moves the sender to a new account and removes the old one.
 
 ## Install

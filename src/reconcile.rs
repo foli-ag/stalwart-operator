@@ -13,6 +13,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{DeleteParams, ObjectMeta, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::finalizer::{self, Event, finalizer};
@@ -24,14 +25,14 @@ use crate::config::{Address, Config};
 use crate::crd::{MailSender, MailSenderStatus, Phase, account_marker};
 use crate::stalwart::{Stalwart, StalwartError};
 
-const FINALIZER: &str = "stalwart.foli.ag/account";
-const MANAGER: &str = "stalwart-operator";
+pub(crate) const FINALIZER: &str = "stalwart.foli.ag/account";
+pub(crate) const MANAGER: &str = "stalwart-operator";
 const MANAGED_BY: (&str, &str) = ("app.kubernetes.io/managed-by", "stalwart-operator");
 /// Change this annotation's value on a `MailSender` to rotate its app password.
-const ROTATE: &str = "stalwart.foli.ag/rotate";
+pub(crate) const ROTATE: &str = "stalwart.foli.ag/rotate";
 /// The `ROTATE` value the Secret's password was created for.
 const ROTATED: &str = "stalwart.foli.ag/rotated";
-const RETRY: Duration = Duration::from_secs(30);
+pub(crate) const RETRY: Duration = Duration::from_secs(30);
 
 const PASSWORD: &str = "password";
 const USERNAME: &str = "username";
@@ -55,18 +56,26 @@ pub enum Error {
     Finalizer(#[source] Box<finalizer::Error<Error>>),
 }
 
-struct Context {
-    kube: kube::Client,
-    config: Config,
-    stalwart: Stalwart,
+pub(crate) struct Context {
+    pub kube: kube::Client,
+    pub config: Config,
+    pub stalwart: Stalwart,
 }
 
+/// Runs the `MailSender` and `ClusterMailSender` controllers until a shutdown signal.
 pub async fn run(kube: kube::Client, config: Config, stalwart: Stalwart) {
     let context = Arc::new(Context {
         kube: kube.clone(),
         config,
         stalwart,
     });
+    tokio::join!(
+        run_mail_senders(kube, context.clone()),
+        crate::cluster::run(context),
+    );
+}
+
+async fn run_mail_senders(kube: kube::Client, context: Arc<Context>) {
     let owned = watcher::Config::default().labels(&format!("{}={}", MANAGED_BY.0, MANAGED_BY.1));
 
     Controller::new(
@@ -176,42 +185,24 @@ async fn sync(
         return Err(Error::SecretTaken(secret_name));
     }
 
-    let domain_id = stalwart
-        .domain_id(address.domain())
-        .await?
-        .ok_or_else(|| Error::UnknownDomain(address.domain().to_owned()))?;
-    match stalwart.find_account(address.local(), &domain_id).await? {
-        Some(account) if account.description.as_deref() == Some(marker.as_str()) => {}
-        Some(_) => return Err(Error::AddressTaken(address.to_string())),
-        None => {
-            stalwart
-                .create_account(address.local(), &domain_id, &marker)
-                .await?;
-        }
-    }
-
-    let login = address.to_string();
-    let credentials = stalwart.app_password_ids(&login).await?;
+    ensure_account(stalwart, address, &marker).await?;
     let rotate = object.annotations().get(ROTATE).map(String::as_str);
     let stored = Stored::read(existing.as_ref());
-    let (password, credential_id) = match stored.keep(&login, &credentials, rotate) {
-        Some(kept) => kept,
-        None => {
-            let created = stalwart
-                .create_app_password(&login, &format!("MailSender {namespace}/{name}"))
-                .await?;
-            (created.secret, created.id)
-        }
-    };
+    let issued = issue_password(
+        stalwart,
+        address,
+        &stored,
+        rotate,
+        &format!("MailSender {namespace}/{name}"),
+    )
+    .await?;
 
-    let rotated = rotate.map(str::to_owned).or(stored.rotated);
     let secret = build_secret(
-        object,
+        object.controller_owner_ref(&()),
+        namespace,
         &secret_name,
         address,
-        &password,
-        &credential_id,
-        rotated.as_deref(),
+        &issued,
         &context.config,
     );
     secrets
@@ -224,18 +215,16 @@ async fn sync(
 
     // Only once the Secret holds the new password: a failure before this leaves
     // the old one working, and the next reconcile removes the strays.
-    let stale: Vec<String> = credentials
-        .into_iter()
-        .filter(|id| *id != credential_id)
-        .collect();
-    stalwart.destroy_app_passwords(&login, &stale).await?;
+    stalwart
+        .destroy_app_passwords(&address.to_string(), &issued.stale)
+        .await?;
 
     // `address` changed: the old account sends for nobody.
     if let Some(old) = object
         .status
         .as_ref()
         .and_then(|status| status.address.as_deref())
-        && old != login
+        && old != address.to_string()
     {
         remove_account(old, &marker, stalwart).await?;
     }
@@ -267,8 +256,75 @@ async fn cleanup(object: &MailSender, namespace: &str, context: &Context) -> Res
     Ok(Action::await_change())
 }
 
+/// Makes sure the account for `address` exists and was created for the sender
+/// `marker` names, creating it if no account has the address.
+pub(crate) async fn ensure_account(
+    stalwart: &Stalwart,
+    address: &Address,
+    marker: &str,
+) -> Result<(), Error> {
+    let domain_id = stalwart
+        .domain_id(address.domain())
+        .await?
+        .ok_or_else(|| Error::UnknownDomain(address.domain().to_owned()))?;
+    match stalwart.find_account(address.local(), &domain_id).await? {
+        Some(account) if account.description.as_deref() == Some(marker) => Ok(()),
+        Some(_) => Err(Error::AddressTaken(address.to_string())),
+        None => {
+            stalwart
+                .create_account(address.local(), &domain_id, marker)
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+/// The app password a sender's Secrets hold, and the account's other ones,
+/// which are removed once every Secret holds this one.
+pub(crate) struct Issued {
+    pub password: String,
+    pub credential_id: String,
+    /// The `ROTATE` value the password was created for.
+    pub rotated: Option<String>,
+    pub stale: Vec<String>,
+}
+
+/// Keeps the password `stored` holds while it is still good, or creates one
+/// named `label` on the account.
+pub(crate) async fn issue_password(
+    stalwart: &Stalwart,
+    address: &Address,
+    stored: &Stored,
+    rotate: Option<&str>,
+    label: &str,
+) -> Result<Issued, Error> {
+    let login = address.to_string();
+    let credentials = stalwart.app_password_ids(&login).await?;
+    let (password, credential_id) = match stored.keep(&login, &credentials, rotate) {
+        Some(kept) => kept,
+        None => {
+            let created = stalwart.create_app_password(&login, label).await?;
+            (created.secret, created.id)
+        }
+    };
+    let stale = credentials
+        .into_iter()
+        .filter(|id| *id != credential_id)
+        .collect();
+    Ok(Issued {
+        password,
+        credential_id,
+        rotated: rotate.map(str::to_owned).or(stored.rotated.clone()),
+        stale,
+    })
+}
+
 /// Removes the account for `address` if this sender created it.
-async fn remove_account(address: &str, marker: &str, stalwart: &Stalwart) -> Result<(), Error> {
+pub(crate) async fn remove_account(
+    address: &str,
+    marker: &str,
+    stalwart: &Stalwart,
+) -> Result<(), Error> {
     let Ok(address) = Address::parse(address) else {
         return Ok(());
     };
@@ -297,7 +353,8 @@ async fn patch_status(
     Ok(())
 }
 
-fn owned_by(secret: &Secret, object: &MailSender) -> bool {
+/// Whether `object` owns `secret`, so the operator may rewrite or delete it.
+pub(crate) fn owned_by(secret: &Secret, object: &impl Resource) -> bool {
     let uid = object.uid();
     secret
         .owner_references()
@@ -307,7 +364,7 @@ fn owned_by(secret: &Secret, object: &MailSender) -> bool {
 
 /// What an existing Secret holds.
 #[derive(Debug, Default, PartialEq)]
-struct Stored {
+pub(crate) struct Stored {
     username: Option<String>,
     password: Option<String>,
     credential_id: Option<String>,
@@ -315,7 +372,7 @@ struct Stored {
 }
 
 impl Stored {
-    fn read(secret: Option<&Secret>) -> Self {
+    pub(crate) fn read(secret: Option<&Secret>) -> Self {
         let Some(secret) = secret else {
             return Self::default();
         };
@@ -354,15 +411,22 @@ impl Stored {
     }
 }
 
-fn build_secret(
-    object: &MailSender,
+/// The Secret `name` in `namespace` holding `issued`'s credentials, owned by the
+/// sender `owner` references, so it goes when the sender does.
+pub(crate) fn build_secret(
+    owner: Option<OwnerReference>,
+    namespace: &str,
     name: &str,
     address: &Address,
-    password: &str,
-    credential_id: &str,
-    rotated: Option<&str>,
+    issued: &Issued,
     config: &Config,
 ) -> Secret {
+    let Issued {
+        password,
+        credential_id,
+        rotated,
+        ..
+    } = issued;
     let username = address.to_string();
     let data = BTreeMap::from([
         ("host".to_owned(), config.smtp.host.clone()),
@@ -377,23 +441,24 @@ fn build_secret(
             .to_owned(),
         ),
         (USERNAME.to_owned(), username.clone()),
-        (PASSWORD.to_owned(), password.to_owned()),
+        (PASSWORD.to_owned(), password.clone()),
         ("address".to_owned(), username.clone()),
         ("url".to_owned(), config.smtp_url(&username, password)),
-        (CREDENTIAL_ID.to_owned(), credential_id.to_owned()),
+        (CREDENTIAL_ID.to_owned(), credential_id.clone()),
     ]);
 
     Secret {
         metadata: ObjectMeta {
             name: Some(name.to_owned()),
-            namespace: object.namespace(),
+            namespace: Some(namespace.to_owned()),
             labels: Some(BTreeMap::from([(
                 MANAGED_BY.0.to_owned(),
                 MANAGED_BY.1.to_owned(),
             )])),
             annotations: rotated
-                .map(|rotated| BTreeMap::from([(ROTATED.to_owned(), rotated.to_owned())])),
-            owner_references: object.controller_owner_ref(&()).map(|owner| vec![owner]),
+                .as_ref()
+                .map(|rotated| BTreeMap::from([(ROTATED.to_owned(), rotated.clone())])),
+            owner_references: owner.map(|owner| vec![owner]),
             ..ObjectMeta::default()
         },
         type_: Some("Opaque".to_owned()),

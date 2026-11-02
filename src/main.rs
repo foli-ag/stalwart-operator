@@ -1,6 +1,7 @@
-//! `stalwart-operator`: gives every `MailSender` a Stalwart account and writes its
-//! SMTP credentials into a Secret.
+//! `stalwart-operator`: gives every `MailSender` and `ClusterMailSender` a
+//! Stalwart account and writes its SMTP credentials into Secrets.
 
+mod cluster;
 mod config;
 mod crd;
 mod reconcile;
@@ -10,7 +11,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use kube::CustomResourceExt;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -33,14 +33,15 @@ enum Command {
         #[arg(long, env = "STALWART_PASSWORD", hide_env_values = true)]
         password: String,
     },
-    /// Print the `MailSender` CustomResourceDefinition as YAML.
+    /// Print the `MailSender` and `ClusterMailSender` CustomResourceDefinitions as
+    /// YAML.
     Crd,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     match Args::parse().command {
-        Command::Crd => match serde_yaml::to_string(&crd::MailSender::crd()) {
+        Command::Crd => match crd::crds_yaml() {
             Ok(yaml) => {
                 print!("{yaml}");
                 ExitCode::SUCCESS
